@@ -50,9 +50,9 @@ export const TELEGRAM_BETWEEN_MSG_MS = 350;
 
 // Routes
 export const ROUND_TRIP_ROUTES: RouteConfig[] = [
-  // Europe direct (or enforce direct)
+  // Europe - prefer direct, fallback to 1 stopover
   { destination: "LHR", destinationName: "Londra", maxStopoversPerLeg: 0, priceThresholdEUR: 120, category: "europe", nonStopPreferred: true },
-  { destination: "CDG", destinationName: "Paris",  maxStopoversPerLeg: 0, priceThresholdEUR: 120, category: "europe", nonStopPreferred: true },
+  { destination: "CDG", destinationName: "Paris", maxStopoversPerLeg: 0, priceThresholdEUR: 120, category: "europe", nonStopPreferred: true },
   { destination: "AMS", destinationName: "Amsterdam", maxStopoversPerLeg: 0, priceThresholdEUR: 120, category: "europe", nonStopPreferred: true },
   { destination: "BCN", destinationName: "Barcelona", maxStopoversPerLeg: 0, priceThresholdEUR: 120, category: "europe", nonStopPreferred: true },
   { destination: "FCO", destinationName: "Roma", maxStopoversPerLeg: 0, priceThresholdEUR: 100, category: "europe", nonStopPreferred: true },
@@ -66,11 +66,11 @@ export const ROUND_TRIP_ROUTES: RouteConfig[] = [
   { destination: "SKP", destinationName: "Üsküp", maxStopoversPerLeg: 0, priceThresholdEUR: 80, category: "europe", nonStopPreferred: true },
   { destination: "PRN", destinationName: "Priştine", maxStopoversPerLeg: 0, priceThresholdEUR: 80, category: "europe", nonStopPreferred: true },
 
-  // Via Germany only (allow 1 stop, and if a stop exists it must be DE only)
-  { destination: "KEF", destinationName: "Reykjavik", maxStopoversPerLeg: 1, stopoverCountry: "DE", priceThresholdEUR: 250, category: "europe" },
-  { destination: "DUB", destinationName: "Dublin", maxStopoversPerLeg: 1, stopoverCountry: "DE", priceThresholdEUR: 150, category: "europe" },
+  // Europe - max 1 stopover (any country)
+  { destination: "KEF", destinationName: "Reykjavik", maxStopoversPerLeg: 1, priceThresholdEUR: 250, category: "europe" },
+  { destination: "DUB", destinationName: "Dublin", maxStopoversPerLeg: 1, priceThresholdEUR: 150, category: "europe" },
 
-  // Longhaul max 2 per leg
+  // Longhaul - max 2 stopovers per leg
   { destination: "JFK", destinationName: "New York", maxStopoversPerLeg: 2, priceThresholdEUR: 500, category: "longhaul" },
   { destination: "MIA", destinationName: "Miami", maxStopoversPerLeg: 2, priceThresholdEUR: 550, category: "longhaul" },
   { destination: "DFW", destinationName: "Dallas", maxStopoversPerLeg: 2, priceThresholdEUR: 550, category: "longhaul" },
@@ -92,7 +92,7 @@ export const ROUND_TRIP_ROUTES: RouteConfig[] = [
 
 export const OPEN_JAW_ROUTES: OpenJawConfig[] = [
   { outboundTo: "GVA", outboundToName: "Cenevre", inboundFrom: "BSL", inboundFromName: "Basel", maxStopoversPerLeg: 1, priceThresholdEUR: 150, category: "europe" },
-  { outboundTo: "MXP", outboundToName: "Milano",  inboundFrom: "FCO", inboundFromName: "Roma",  maxStopoversPerLeg: 1, priceThresholdEUR: 150, category: "europe" },
+  { outboundTo: "MXP", outboundToName: "Milano", inboundFrom: "FCO", inboundFromName: "Roma", maxStopoversPerLeg: 1, priceThresholdEUR: 150, category: "europe" },
   { outboundTo: "BCN", outboundToName: "Barcelona", inboundFrom: "MAD", inboundFromName: "Madrid", maxStopoversPerLeg: 1, priceThresholdEUR: 150, category: "europe" },
 ];
 

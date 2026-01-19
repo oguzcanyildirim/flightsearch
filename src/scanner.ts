@@ -96,10 +96,10 @@ function buildRoundTripModes(route: RouteConfig): RoundTripSearchMode[] {
     return [
       { label: "direct", nonStop: true, maxStopoversPerLeg: 0 },
       {
-        label: "DE stopover",
+        label: "1 stopover",
         nonStop: false,
         maxStopoversPerLeg: 1,
-        requiredStopoverCountry: "DE",
+        // No country restriction - any stopover is fine
         isFallback: true,
       },
     ];
