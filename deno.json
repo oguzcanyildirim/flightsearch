@@ -1,7 +1,7 @@
 {
   "tasks": {
-    "scan": "deno run --allow-net --allow-env --allow-read --allow-write src/scanner.ts",
-    "test": "deno test --allow-net --allow-env --allow-read --allow-write"
+    "scan": "deno run --env --allow-net --allow-env --allow-read --allow-write src/scanner.ts",
+    "test": "deno test --env --allow-net --allow-env --allow-read --allow-write"
   },
   "compilerOptions": {
     "strict": true
