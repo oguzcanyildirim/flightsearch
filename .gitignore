@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Cache
+seen_deals.json
+
 # Dependencies
 node_modules/
 
