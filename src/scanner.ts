@@ -1,312 +1,588 @@
-// Flight Deal Scanner - Ankara (ESB) Departures
-// Uses Kiwi Tequila API + Telegram Notifications
+// scanner.ts
 
-interface FlightConfig {
+import {
+  BETWEEN_ROUTE_SLEEP_MS,
+  CURRENCY,
+  getAirportCountry,
+  getSearchDateRange,
+  MIN_NIGHTS,
+  MAX_NIGHTS,
+  OPEN_JAW_ROUTES,
+  ORIGIN,
+  pickDurationDays,
+  ROUND_TRIP_ROUTES,
+  SEEN_DEALS_FILE,
+  SEEN_DEALS_TTL_MS,
+  TELEGRAM_BETWEEN_MSG_MS,
+} from "./config.ts";
+
+import { AmadeusClient, sleep, HttpError } from "./amadeus.ts";
+import type { AmadeusOffer, AmadeusSegment } from "./amadeus.ts";
+import { SeenDealStore } from "./dedupe.ts";
+import type { Deal } from "./types.ts";
+import { buildDealMessage, sendTelegram } from "./telegram.ts";
+import type { RouteConfig, OpenJawConfig } from "./config.ts";
+
+function env(name: string): string {
+  return Deno.env.get(name) ?? "";
+}
+
+function requireEnv(names: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const n of names) {
+    const v = env(n);
+    if (!v) missing.push(n);
+    else out[n] = v;
+  }
+  if (missing.length) {
+    console.error(`Missing env: ${missing.join(", ")}`);
+    Deno.exit(1);
+  }
+  return out;
+}
+
+function stopoverCountries(segments: AmadeusSegment[]): (string | undefined)[] {
+  const countries: (string | undefined)[] = [];
+  for (let i = 0; i < segments.length - 1; i++) {
+    const airport = segments[i].arrival.iataCode;
+    countries.push(getAirportCountry(airport));
+  }
+  return countries;
+}
+
+function validateLegStopovers(args: {
+  segments: AmadeusSegment[];
+  maxStopovers: number;
+  requiredCountry?: string;
+}): { ok: boolean; stops: number } {
+  const stops = Math.max(0, args.segments.length - 1);
+  if (stops > args.maxStopovers) return { ok: false, stops };
+
+  if (!args.requiredCountry || stops === 0) return { ok: true, stops };
+
+  // Strict rule: if stopoverCountry is set and there is at least 1 stop,
+  // every stopover must be in that country. Unknown country fails.
+  const countries = stopoverCountries(args.segments);
+  const allMatch = countries.length > 0 && countries.every((c) => c === args.requiredCountry);
+  return { ok: allMatch, stops };
+}
+
+function dealHash(parts: string[]): string {
+  const key = parts.join("|");
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) h = ((h << 5) + h) ^ key.charCodeAt(i);
+  return (h >>> 0).toString(16);
+}
+
+function offerChain(segments: AmadeusSegment[]): string {
+  if (!segments.length) return "";
+  const dep = segments.map((s) => s.departure.iataCode).join("-");
+  const arr = segments[segments.length - 1].arrival.iataCode;
+  return `${dep}-${arr}`;
+}
+
+type RoundTripSearchMode = {
+  label: string;
+  nonStop: boolean;
+  maxStopoversPerLeg: number;
+  requiredStopoverCountry?: string;
+  isFallback?: boolean;
+};
+
+function buildRoundTripModes(route: RouteConfig): RoundTripSearchMode[] {
+  const prefersDirect = route.nonStopPreferred === true && route.maxStopoversPerLeg === 0;
+  if (route.category === "europe" && prefersDirect) {
+    return [
+      { label: "direct", nonStop: true, maxStopoversPerLeg: 0 },
+      {
+        label: "DE stopover",
+        nonStop: false,
+        maxStopoversPerLeg: 1,
+        requiredStopoverCountry: "DE",
+        isFallback: true,
+      },
+    ];
+  }
+
+  return [
+    {
+      label: "default",
+      nonStop: route.nonStopPreferred === true || route.maxStopoversPerLeg === 0,
+      maxStopoversPerLeg: route.maxStopoversPerLeg,
+      requiredStopoverCountry: route.stopoverCountry,
+    },
+  ];
+}
+
+function buildRoundTripDeal(args: {
+  offer: AmadeusOffer;
   destination: string;
   destinationName: string;
-  maxStopovers: number;
-  stopoverVia?: string; // For Germany-only stopovers
-  priceThreshold: number; // TRY
-  category: "europe" | "longhaul";
-}
+  maxStopoversPerLeg: number;
+  requiredStopoverCountry?: string;
+  priceThresholdEUR: number;
+  category: Deal["category"];
+}): Deal | null {
+  const { offer } = args;
 
-interface Flight {
-  price: number;
-  currency: string;
-  deep_link: string;
-  route: RouteSegment[];
-  duration: { total: number };
-  airlines: string[];
-}
+  const price = Number(offer.price.total);
+  if (!Number.isFinite(price)) return null;
+  if (offer.price.currency !== CURRENCY) return null;
+  if (price > args.priceThresholdEUR) return null;
 
-interface RouteSegment {
-  flyFrom: string;
-  flyTo: string;
-  cityFrom: string;
-  cityTo: string;
-  local_departure: string;
-  local_arrival: string;
-  airline: string;
-}
+  const out = offer.itineraries[0];
+  const inn = offer.itineraries[1];
+  if (!out || !inn) return null;
 
-interface SearchResult {
-  data: Flight[];
-  currency: string;
-}
-
-// ===========================================
-// CONFIGURATION - Customize your searches here
-// ===========================================
-
-const ROUTES: FlightConfig[] = [
-  // ========== EUROPE - Direct or 1 stop via Germany ==========
-  // Popular direct destinations from Ankara
-  { destination: "LON", destinationName: "Londra", maxStopovers: 0, priceThreshold: 4000, category: "europe" },
-  { destination: "PAR", destinationName: "Paris", maxStopovers: 0, priceThreshold: 4000, category: "europe" },
-  { destination: "AMS", destinationName: "Amsterdam", maxStopovers: 0, priceThreshold: 4000, category: "europe" },
-  { destination: "BCN", destinationName: "Barcelona", maxStopovers: 0, priceThreshold: 4000, category: "europe" },
-  { destination: "ROM", destinationName: "Roma", maxStopovers: 0, priceThreshold: 3500, category: "europe" },
-  { destination: "VIE", destinationName: "Viyana", maxStopovers: 0, priceThreshold: 3500, category: "europe" },
-  { destination: "PRG", destinationName: "Prag", maxStopovers: 0, priceThreshold: 3500, category: "europe" },
-  { destination: "CPH", destinationName: "Kopenhag", maxStopovers: 0, priceThreshold: 4500, category: "europe" },
-  { destination: "LIS", destinationName: "Lizbon", maxStopovers: 0, priceThreshold: 4500, category: "europe" },
-  { destination: "ATH", destinationName: "Atina", maxStopovers: 0, priceThreshold: 3000, category: "europe" },
-  { destination: "BUD", destinationName: "Budapeşte", maxStopovers: 0, priceThreshold: 3000, category: "europe" },
-  
-  // Germany connections (1 stop allowed via Germany)
-  { destination: "REK", destinationName: "Reykjavik", maxStopovers: 1, stopoverVia: "DE", priceThreshold: 8000, category: "europe" },
-  { destination: "OSL", destinationName: "Oslo", maxStopovers: 1, stopoverVia: "DE", priceThreshold: 5000, category: "europe" },
-  { destination: "HEL", destinationName: "Helsinki", maxStopovers: 1, stopoverVia: "DE", priceThreshold: 5000, category: "europe" },
-  { destination: "DUB", destinationName: "Dublin", maxStopovers: 1, stopoverVia: "DE", priceThreshold: 5000, category: "europe" },
-  { destination: "EDI", destinationName: "Edinburgh", maxStopovers: 1, stopoverVia: "DE", priceThreshold: 5000, category: "europe" },
-  
-  // ========== LONG HAUL - Max 2 stopovers ==========
-  // USA - Solo travel friendly
-  { destination: "MIA", destinationName: "Miami", maxStopovers: 2, priceThreshold: 20000, category: "longhaul" },
-  { destination: "DFW", destinationName: "Dallas/Texas", maxStopovers: 2, priceThreshold: 20000, category: "longhaul" },
-  { destination: "IAH", destinationName: "Houston/Texas", maxStopovers: 2, priceThreshold: 20000, category: "longhaul" },
-  { destination: "HNL", destinationName: "Hawaii", maxStopovers: 2, priceThreshold: 30000, category: "longhaul" },
-  { destination: "LAX", destinationName: "Los Angeles", maxStopovers: 2, priceThreshold: 20000, category: "longhaul" },
-  { destination: "SFO", destinationName: "San Francisco", maxStopovers: 2, priceThreshold: 20000, category: "longhaul" },
-  
-  // Asia Pacific - Solo travel friendly
-  { destination: "SIN", destinationName: "Singapur", maxStopovers: 2, priceThreshold: 18000, category: "longhaul" },
-  { destination: "KUL", destinationName: "Kuala Lumpur", maxStopovers: 2, priceThreshold: 16000, category: "longhaul" },
-  { destination: "PER", destinationName: "Perth", maxStopovers: 2, priceThreshold: 25000, category: "longhaul" },
-  { destination: "AKL", destinationName: "Auckland/Yeni Zelanda", maxStopovers: 2, priceThreshold: 35000, category: "longhaul" },
-  { destination: "SYD", destinationName: "Sydney", maxStopovers: 2, priceThreshold: 25000, category: "longhaul" },
-  { destination: "MEL", destinationName: "Melbourne", maxStopovers: 2, priceThreshold: 25000, category: "longhaul" },
-  { destination: "BKK", destinationName: "Bangkok", maxStopovers: 2, priceThreshold: 15000, category: "longhaul" },
-  { destination: "TYO", destinationName: "Tokyo", maxStopovers: 2, priceThreshold: 20000, category: "longhaul" },
-];
-
-// ===========================================
-// API & TELEGRAM SETUP
-// ===========================================
-
-const KIWI_API_KEY = Deno.env.get("KIWI_API_KEY") || "";
-const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
-const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "";
-const ORIGIN = "ESB"; // Ankara Esenboğa
-
-// ===========================================
-// HELPER FUNCTIONS
-// ===========================================
-
-function getDateRange(): { dateFrom: string; dateTo: string } {
-  const today = new Date();
-  const dateFrom = new Date(today);
-  dateFrom.setDate(today.getDate() + 14); // Start searching 2 weeks from now
-  
-  const dateTo = new Date(today);
-  dateTo.setMonth(today.getMonth() + 6); // Search up to 6 months ahead
-  
-  const format = (d: Date) => `${d.getDate().toString().padStart(2, '0')}/${(d.getMonth() + 1).toString().padStart(2, '0')}/${d.getFullYear()}`;
-  
-  return {
-    dateFrom: format(dateFrom),
-    dateTo: format(dateTo),
-  };
-}
-
-function formatDuration(minutes: number): string {
-  const hours = Math.floor(minutes / 60);
-  const mins = minutes % 60;
-  return `${hours}s ${mins}dk`;
-}
-
-function formatPrice(price: number): string {
-  return new Intl.NumberFormat('tr-TR').format(Math.round(price));
-}
-
-function formatDate(dateStr: string): string {
-  const date = new Date(dateStr);
-  const options: Intl.DateTimeFormatOptions = { 
-    day: 'numeric', 
-    month: 'short', 
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit'
-  };
-  return date.toLocaleDateString('tr-TR', options);
-}
-
-// ===========================================
-// KIWI API SEARCH
-// ===========================================
-
-async function searchFlights(config: FlightConfig): Promise<Flight[]> {
-  const { dateFrom, dateTo } = getDateRange();
-  
-  const params = new URLSearchParams({
-    fly_from: ORIGIN,
-    fly_to: config.destination,
-    date_from: dateFrom,
-    date_to: dateTo,
-    nights_in_dst_from: "3",  // Min 3 nights
-    nights_in_dst_to: "14",   // Max 14 nights
-    flight_type: "round",
-    curr: "TRY",
-    locale: "tr",
-    max_stopovers: config.maxStopovers.toString(),
-    limit: "5",
-    sort: "price",
-    asc: "1",
+  const outVal = validateLegStopovers({
+    segments: out.segments,
+    maxStopovers: args.maxStopoversPerLeg,
+    requiredCountry: args.requiredStopoverCountry,
   });
-  
-  // Add stopover filter for Germany-only routes
-  if (config.stopoverVia) {
-    params.set("stopover_from", config.stopoverVia);
-    params.set("stopover_to", config.stopoverVia);
-  }
-  
-  const url = `https://api.tequila.kiwi.com/v2/search?${params}`;
-  
+  if (!outVal.ok) return null;
+
+  const inVal = validateLegStopovers({
+    segments: inn.segments,
+    maxStopovers: args.maxStopoversPerLeg,
+    requiredCountry: args.requiredStopoverCountry,
+  });
+  if (!inVal.ok) return null;
+
+  const outboundDate = out.segments[0]?.departure.at?.slice(0, 10);
+  const inboundDate = inn.segments[0]?.departure.at?.slice(0, 10);
+  if (!outboundDate || !inboundDate) return null;
+
+  const hash = dealHash([
+    "RT",
+    ORIGIN,
+    args.destination,
+    outboundDate,
+    inboundDate,
+    price.toFixed(2),
+    offerChain(out.segments),
+    offerChain(inn.segments),
+  ]);
+
+  return {
+    type: "roundtrip",
+    destination: args.destination,
+    destinationName: args.destinationName,
+    price,
+    currency: offer.price.currency,
+    outboundDate,
+    inboundDate,
+    outboundSegments: out.segments,
+    inboundSegments: inn.segments,
+    outboundStops: outVal.stops,
+    inboundStops: inVal.stops,
+    airlines: offer.validatingAirlineCodes ?? [],
+    category: args.category,
+    priceThresholdEUR: args.priceThresholdEUR,
+    hash,
+  };
+}
+
+function buildOpenJawDeal(args: {
+  outboundOffer: AmadeusOffer;
+  inboundOffer: AmadeusOffer;
+  outboundTo: string;
+  outboundToName: string;
+  inboundFrom: string;
+  inboundFromName: string;
+  maxStopoversPerLeg: number;
+  requiredStopoverCountry?: string;
+  priceThresholdEUR: number;
+  category: Deal["category"];
+}): Deal | null {
+  const outPrice = Number(args.outboundOffer.price.total);
+  const inPrice = Number(args.inboundOffer.price.total);
+  if (!Number.isFinite(outPrice) || !Number.isFinite(inPrice)) return null;
+
+  if (args.outboundOffer.price.currency !== CURRENCY) return null;
+  if (args.inboundOffer.price.currency !== CURRENCY) return null;
+
+  const total = outPrice + inPrice;
+  if (total > args.priceThresholdEUR) return null;
+
+  const outIt = args.outboundOffer.itineraries[0];
+  const inIt = args.inboundOffer.itineraries[0];
+  if (!outIt || !inIt) return null;
+
+  const outVal = validateLegStopovers({
+    segments: outIt.segments,
+    maxStopovers: args.maxStopoversPerLeg,
+    requiredCountry: args.requiredStopoverCountry,
+  });
+  if (!outVal.ok) return null;
+
+  const inVal = validateLegStopovers({
+    segments: inIt.segments,
+    maxStopovers: args.maxStopoversPerLeg,
+    requiredCountry: args.requiredStopoverCountry,
+  });
+  if (!inVal.ok) return null;
+
+  const outboundDate = outIt.segments[0]?.departure.at?.slice(0, 10);
+  const inboundDate = inIt.segments[0]?.departure.at?.slice(0, 10);
+  if (!outboundDate || !inboundDate) return null;
+
+  // nights check (based on arrival to destination and departure back)
+  const arrive = new Date(outIt.segments[outIt.segments.length - 1].arrival.at);
+  const departBack = new Date(inIt.segments[0].departure.at);
+  const nights = Math.floor((departBack.getTime() - arrive.getTime()) / (24 * 60 * 60 * 1000));
+  if (nights < MIN_NIGHTS || nights > MAX_NIGHTS) return null;
+
+  const airlines = [...(args.outboundOffer.validatingAirlineCodes ?? []), ...(args.inboundOffer.validatingAirlineCodes ?? [])]
+    .filter((v, i, a) => a.indexOf(v) === i);
+
+  const hash = dealHash([
+    "OJ",
+    ORIGIN,
+    args.outboundTo,
+    args.inboundFrom,
+    outboundDate,
+    inboundDate,
+    total.toFixed(2),
+    offerChain(outIt.segments),
+    offerChain(inIt.segments),
+  ]);
+
+  return {
+    type: "openjaw",
+    destination: args.outboundTo,
+    destinationName: args.outboundToName,
+    returnFrom: args.inboundFrom,
+    returnFromName: args.inboundFromName,
+    price: total,
+    currency: CURRENCY,
+    outboundDate,
+    inboundDate,
+    outboundSegments: outIt.segments,
+    inboundSegments: inIt.segments,
+    outboundStops: outVal.stops,
+    inboundStops: inVal.stops,
+    airlines,
+    category: args.category,
+    priceThresholdEUR: args.priceThresholdEUR,
+    hash,
+  };
+}
+
+async function pickDatePairs(args: {
+  amadeus: AmadeusClient;
+  origin: string;
+  destination: string;
+  dateRange: { from: string; to: string };
+  durationDays: number;
+  nonStop: boolean;
+  maxPriceEUR: number;
+  pairCount: number;
+}): Promise<Array<{ dep: string; ret: string }>> {
+  let cheapest: { departureDate: string; returnDate: string; price: number }[] = [];
   try {
-    const response = await fetch(url, {
-      headers: {
-        "apikey": KIWI_API_KEY,
-        "accept": "application/json",
-      },
+    const rows = await args.amadeus.fetchCheapestDates({
+      origin: args.origin,
+      destination: args.destination,
+      dateRange: args.dateRange,
+      durationDays: args.durationDays,
+      nonStop: args.nonStop,
+      maxPriceEUR: args.maxPriceEUR,
+      limit: 5,
     });
-    
-    if (!response.ok) {
-      console.error(`API error for ${config.destinationName}: ${response.status}`);
-      return [];
+
+    cheapest = rows
+      .map((x) => ({
+        departureDate: x.departureDate,
+        returnDate: x.returnDate,
+        price: Number(x.price?.total),
+      }))
+      .filter((x) => Number.isFinite(x.price))
+      .sort((a, b) => a.price - b.price)
+      .slice(0, 3);
+  } catch (e) {
+    if (e instanceof HttpError) {
+      // unsupported route in flight-dates, fall back
+    } else {
+      console.log(`  flight-dates error`);
     }
-    
-    const data: SearchResult = await response.json();
-    return data.data || [];
-  } catch (error) {
-    console.error(`Error searching ${config.destinationName}:`, error);
-    return [];
   }
+
+  return cheapest.length
+    ? cheapest.map((c) => ({ dep: c.departureDate, ret: c.returnDate }))
+    : fallbackPairs(args.dateRange, args.durationDays, args.pairCount);
 }
 
-// ===========================================
-// TELEGRAM NOTIFICATION
-// ===========================================
+async function scanRoundTripMode(args: {
+  route: RouteConfig;
+  mode: RoundTripSearchMode;
+  durationDays: number;
+  dateRange: { from: string; to: string };
+  amadeus: AmadeusClient;
+  store: SeenDealStore;
+}): Promise<Deal[]> {
+  const pairs = await pickDatePairs({
+    amadeus: args.amadeus,
+    origin: ORIGIN,
+    destination: args.route.destination,
+    dateRange: args.dateRange,
+    durationDays: args.durationDays,
+    nonStop: args.mode.nonStop,
+    maxPriceEUR: args.route.priceThresholdEUR,
+    pairCount: 2,
+  });
 
-async function sendTelegramMessage(message: string): Promise<void> {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: "HTML",
-        disable_web_page_preview: false,
-      }),
-    });
-  } catch (error) {
-    console.error("Telegram error:", error);
-  }
-}
-
-function buildDealMessage(config: FlightConfig, flight: Flight): string {
-  const stopovers = flight.route.length / 2 - 1; // Round trip, so divide by 2
-  const stopoverText = stopovers === 0 ? "✈️ AKTARMASIZ" : `🔄 ${stopovers} aktarma`;
-  
-  const outbound = flight.route.slice(0, flight.route.length / 2);
-  const inbound = flight.route.slice(flight.route.length / 2);
-  
-  const routeDetails = outbound.map(r => `${r.cityFrom} → ${r.cityTo}`).join(" → ");
-  const airlines = [...new Set(flight.airlines)].join(", ");
-  
-  const emoji = config.category === "europe" ? "🇪🇺" : "🌏";
-  const fireEmoji = flight.price < config.priceThreshold * 0.7 ? "🔥🔥🔥" : 
-                    flight.price < config.priceThreshold * 0.85 ? "🔥🔥" : "🔥";
-  
-  return `
-${emoji} <b>${config.destinationName.toUpperCase()}</b> ${fireEmoji}
-
-💰 <b>${formatPrice(flight.price)} ₺</b>
-${stopoverText}
-⏱️ Toplam: ${formatDuration(flight.duration.total)}
-
-📅 <b>Gidiş:</b> ${formatDate(outbound[0].local_departure)}
-📅 <b>Dönüş:</b> ${formatDate(inbound[0].local_departure)}
-
-🛫 Rota: ${routeDetails}
-✈️ Havayolu: ${airlines}
-
-🔗 <a href="${flight.deep_link}">Bileti Gör</a>
-`.trim();
-}
-
-// ===========================================
-// MAIN SCANNER
-// ===========================================
-
-interface Deal {
-  config: FlightConfig;
-  flight: Flight;
-}
-
-async function runScanner(): Promise<void> {
-  console.log(`🛫 Flight Scanner Started - ${new Date().toISOString()}`);
-  console.log(`📍 Origin: Ankara (ESB)`);
-  console.log(`🔍 Scanning ${ROUTES.length} routes...\n`);
-  
   const deals: Deal[] = [];
-  
-  // Add delay between requests to be nice to the API
-  for (const config of ROUTES) {
-    console.log(`Checking ${config.destinationName}...`);
-    
-    const flights = await searchFlights(config);
-    
-    for (const flight of flights) {
-      if (flight.price <= config.priceThreshold) {
-        deals.push({ config, flight });
-        console.log(`  ✅ DEAL FOUND: ${formatPrice(flight.price)} ₺`);
+  for (const p of pairs) {
+    const offers = await args.amadeus.fetchFlightOffers({
+      origin: ORIGIN,
+      destination: args.route.destination,
+      departureDate: p.dep,
+      returnDate: p.ret,
+      maxOffers: 4,
+      nonStop: args.mode.nonStop,
+    });
+
+    for (const offer of offers) {
+      const deal = buildRoundTripDeal({
+        offer,
+        destination: args.route.destination,
+        destinationName: args.route.destinationName,
+        maxStopoversPerLeg: args.mode.maxStopoversPerLeg,
+        requiredStopoverCountry: args.mode.requiredStopoverCountry,
+        priceThresholdEUR: args.route.priceThresholdEUR,
+        category: args.route.category,
+      });
+
+      if (!deal) continue;
+      if (args.store.has(deal.hash)) continue;
+
+      args.store.mark(deal.hash);
+      deals.push(deal);
+      console.log(`  deal: ${deal.price.toFixed(0)}  ${deal.outboundDate}  stops ${deal.outboundStops}/${deal.inboundStops}`);
+    }
+  }
+
+  return deals;
+}
+
+async function scanOpenJawRoute(args: {
+  route: OpenJawConfig;
+  durationDays: number;
+  dateRange: { from: string; to: string };
+  amadeus: AmadeusClient;
+  store: SeenDealStore;
+}): Promise<Deal[]> {
+  const pairs = fallbackPairs(args.dateRange, args.durationDays, 3);
+  const deals: Deal[] = [];
+
+  for (const p of pairs) {
+    const [outOffers, inOffers] = await Promise.all([
+      args.amadeus.fetchFlightOffers({
+        origin: ORIGIN,
+        destination: args.route.outboundTo,
+        departureDate: p.dep,
+        maxOffers: 3,
+      }),
+      args.amadeus.fetchFlightOffers({
+        origin: args.route.inboundFrom,
+        destination: ORIGIN,
+        departureDate: p.ret,
+        maxOffers: 3,
+      }),
+    ]);
+
+    for (const outOffer of outOffers.slice(0, 2)) {
+      for (const inOffer of inOffers.slice(0, 2)) {
+        const deal = buildOpenJawDeal({
+          outboundOffer: outOffer,
+          inboundOffer: inOffer,
+          outboundTo: args.route.outboundTo,
+          outboundToName: args.route.outboundToName,
+          inboundFrom: args.route.inboundFrom,
+          inboundFromName: args.route.inboundFromName,
+          maxStopoversPerLeg: args.route.maxStopoversPerLeg,
+          requiredStopoverCountry: args.route.stopoverCountry,
+          priceThresholdEUR: args.route.priceThresholdEUR,
+          category: args.route.category,
+        });
+
+        if (!deal) continue;
+        if (args.store.has(deal.hash)) continue;
+
+        args.store.mark(deal.hash);
+        deals.push(deal);
+        console.log(`  deal: ${deal.price.toFixed(0)}  ${deal.outboundDate}  stops ${deal.outboundStops}/${deal.inboundStops}`);
       }
     }
-    
-    // Rate limiting: 500ms between requests
-    await new Promise(resolve => setTimeout(resolve, 500));
   }
-  
-  console.log(`\n📊 Found ${deals.length} deals below threshold`);
-  
-  // Send deals to Telegram
-  if (deals.length > 0) {
-    // Sort by price
-    deals.sort((a, b) => a.flight.price - b.flight.price);
-    
-    // Send summary first
-    const europeDeals = deals.filter(d => d.config.category === "europe");
-    const longhaulDeals = deals.filter(d => d.config.category === "longhaul");
-    
-    const summaryMessage = `
-🔔 <b>UCUZ BİLET ALARMI!</b>
 
-📍 Ankara (ESB) çıkışlı ${deals.length} fırsat bulundu:
-🇪🇺 Avrupa: ${europeDeals.length} fırsat
-🌏 Uzak Mesafe: ${longhaulDeals.length} fırsat
-
-⏰ ${new Date().toLocaleString('tr-TR')}
-`.trim();
-    
-    await sendTelegramMessage(summaryMessage);
-    
-    // Send top deals (max 10 to avoid spam)
-    const topDeals = deals.slice(0, 10);
-    for (const deal of topDeals) {
-      const message = buildDealMessage(deal.config, deal.flight);
-      await sendTelegramMessage(message);
-      await new Promise(resolve => setTimeout(resolve, 300)); // Rate limit Telegram
-    }
-  } else {
-    // Optional: Send "no deals" notification (comment out if too noisy)
-    // await sendTelegramMessage(`😴 Şu an threshold altında fırsat yok. Tarama: ${new Date().toLocaleString('tr-TR')}`);
-  }
-  
-  console.log("✅ Scanner completed");
+  return deals;
 }
 
-// Run the scanner
-runScanner();
+async function main(): Promise<void> {
+  const {
+    AMADEUS_API_KEY,
+    AMADEUS_API_SECRET,
+    AMADEUS_BASE_URL,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+  } = requireEnv([
+    "AMADEUS_API_KEY",
+    "AMADEUS_API_SECRET",
+    "AMADEUS_BASE_URL",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+  ]);
+
+  const amadeus = new AmadeusClient({
+    apiKey: AMADEUS_API_KEY,
+    apiSecret: AMADEUS_API_SECRET,
+    baseUrl: AMADEUS_BASE_URL,
+  });
+
+  const store = new SeenDealStore({ filePath: SEEN_DEALS_FILE, ttlMs: SEEN_DEALS_TTL_MS });
+  await store.load();
+
+  const dateRange = getSearchDateRange();
+  const seed = new Date().getDay();
+
+  console.log(`Origin: ${ORIGIN}`);
+  console.log(`Range: ${dateRange.from} to ${dateRange.to}`);
+  console.log(`Cache: ${store.size()} seen deals`);
+
+  const newDeals: Deal[] = [];
+
+  // Roundtrip
+  for (const r of ROUND_TRIP_ROUTES) {
+    const durationDays = pickDurationDays(r.category, seed);
+    console.log(`Route: ${r.destinationName} (${r.destination})  dur=${durationDays}  threshold=${r.priceThresholdEUR}`);
+
+    const modes = buildRoundTripModes(r);
+    let routeDeals = 0;
+    for (const mode of modes) {
+      console.log(`  mode: ${mode.label}  maxStops=${mode.maxStopoversPerLeg}`);
+      const deals = await scanRoundTripMode({
+        route: r,
+        mode,
+        durationDays,
+        dateRange,
+        amadeus,
+        store,
+      });
+      if (deals.length) {
+        newDeals.push(...deals);
+        routeDeals += deals.length;
+      }
+      if (deals.length > 0 && !mode.isFallback) break;
+    }
+    if (!routeDeals) console.log(`  no deals`);
+
+    await sleep(BETWEEN_ROUTE_SLEEP_MS);
+  }
+
+  // Open Jaw routes
+  for (const oj of OPEN_JAW_ROUTES) {
+    const durationDays = pickDurationDays(oj.category, seed);
+
+    console.log(`OpenJaw: ${oj.outboundToName} → ${oj.inboundFromName}  threshold=${oj.priceThresholdEUR}`);
+    const deals = await scanOpenJawRoute({
+      route: oj,
+      durationDays,
+      dateRange,
+      amadeus,
+      store,
+    });
+    if (deals.length) newDeals.push(...deals);
+
+    await sleep(BETWEEN_ROUTE_SLEEP_MS);
+  }
+
+  // Save seen deals
+  await store.save();
+
+  // Summary
+  console.log(`\nTotal new deals: ${newDeals.length}`);
+
+  // Send to Telegram
+  if (newDeals.length > 0) {
+    // Sort by value ratio (lower = better deal)
+    newDeals.sort((a, b) => (a.price / a.priceThresholdEUR) - (b.price / b.priceThresholdEUR));
+
+    const europeDeals = newDeals.filter((d) => d.category === "europe");
+    const longhaulDeals = newDeals.filter((d) => d.category === "longhaul");
+    const openJawDeals = newDeals.filter((d) => d.type === "openjaw");
+
+    const summary = [
+      `🔔 <b>UCUZ BİLET ALARMI!</b>`,
+      ``,
+      `📍 Ankara (${ORIGIN}) çıkışlı ${newDeals.length} yeni fırsat:`,
+      `🇪🇺 Avrupa: ${europeDeals.length}`,
+      `🌏 Uzak Mesafe: ${longhaulDeals.length}`,
+      `✈️ Open Jaw: ${openJawDeals.length}`,
+      ``,
+      `⏰ ${new Date().toLocaleString("tr-TR")}`,
+    ].join("\n");
+
+    await sendTelegram({
+      botToken: TELEGRAM_BOT_TOKEN,
+      chatId: TELEGRAM_CHAT_ID,
+      html: summary,
+    });
+    await sleep(TELEGRAM_BETWEEN_MSG_MS);
+
+    // Send top 10 deals
+    for (const deal of newDeals.slice(0, 10)) {
+      const msg = buildDealMessage(deal);
+      await sendTelegram({
+        botToken: TELEGRAM_BOT_TOKEN,
+        chatId: TELEGRAM_CHAT_ID,
+        html: msg,
+      });
+      await sleep(TELEGRAM_BETWEEN_MSG_MS);
+    }
+  }
+
+  console.log("Done");
+}
+
+// Fallback date pairs when flight-dates endpoint doesn't work
+function fallbackPairs(
+  range: { from: string; to: string },
+  durationDays: number,
+  count: number
+): Array<{ dep: string; ret: string }> {
+  const pairs: Array<{ dep: string; ret: string }> = [];
+  const start = new Date(range.from);
+  const end = new Date(range.to);
+
+  // Try weekends (Friday departures)
+  for (let w = 0; w < 12 && pairs.length < count; w++) {
+    const dep = new Date(start);
+    dep.setDate(start.getDate() + w * 7);
+
+    // Find next Friday
+    while (dep.getDay() !== 5 && dep < end) {
+      dep.setDate(dep.getDate() + 1);
+    }
+
+    if (dep >= end) break;
+
+    const ret = new Date(dep);
+    ret.setDate(dep.getDate() + durationDays);
+
+    if (ret <= end) {
+      pairs.push({
+        dep: dep.toISOString().slice(0, 10),
+        ret: ret.toISOString().slice(0, 10),
+      });
+    }
+  }
+
+  return pairs;
+}
+
+main().catch((e) => {
+  console.error(e);
+  Deno.exit(1);
+});

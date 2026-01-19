@@ -1,0 +1,48 @@
+name: Flight Scanner
+
+on:
+  schedule:
+    # Günde 2 kez: 08:00, 20:00 UTC
+    # Türkiye saati: 11:00, 23:00
+    # Amadeus free tier: 2000 req/ay, ~39 rota, günde 2 = ~2340/ay
+    - cron: '0 8,20 * * *'
+  
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+      
+      # Cache seen_deals.json between runs to avoid duplicate notifications
+      - name: Restore seen deals cache
+        uses: actions/cache@v4
+        with:
+          path: seen_deals.json
+          key: seen-deals-${{ github.run_id }}
+          restore-keys: |
+            seen-deals-
+      
+      - name: Run Flight Scanner
+        env:
+          AMADEUS_API_KEY: ${{ secrets.AMADEUS_API_KEY }}
+          AMADEUS_API_SECRET: ${{ secrets.AMADEUS_API_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: deno run --allow-net --allow-env --allow-read --allow-write src/scanner.ts
+      
+      # Save the updated seen_deals.json
+      - name: Save seen deals
+        if: always()
+        run: |
+          if [ -f seen_deals.json ]; then
+            echo "Seen deals file exists with $(wc -l < seen_deals.json) lines"
+          fi
